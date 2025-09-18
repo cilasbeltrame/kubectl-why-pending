@@ -37,6 +37,7 @@ func main() {
 	karpenterSince := flag.Duration("karpenter-since", 30*time.Minute, "how far back to read Karpenter logs (e.g. 10m, 1h)")
 	karpenterMaxBytes := flag.Int("karpenter-max-bytes", 1_000_000, "maximum bytes to read from each Karpenter pod logs")
 	karpenterRaw := flag.Bool("karpenter-raw-logs", false, "print raw Karpenter log lines (default: summary only)")
+	karpenterOnlyMatching := flag.Bool("karpenter-only-matching", true, "show only NodePools/Provisioners relevant to the target pod")
 	flag.Parse()
 
 	if *podName == "" {
@@ -82,8 +83,8 @@ func main() {
 			if err != nil {
 				fmt.Println("  (karpenter diagnostics error:", err, ")")
 			}
-			if hits > 0 {
-				runKarpenterDeepDive(ctx, dyn, *ns, *podName)
+            if hits > 0 {
+                runKarpenterDeepDive(ctx, dyn, *ns, *podName, *karpenterOnlyMatching)
 			}
 		}
 		return
@@ -103,8 +104,8 @@ func main() {
 			if err != nil {
 				fmt.Println("  (karpenter diagnostics error:", err, ")")
 			}
-			if hits > 0 {
-				runKarpenterDeepDive(ctx, dyn, *ns, *podName)
+            if hits > 0 {
+                runKarpenterDeepDive(ctx, dyn, *ns, *podName, *karpenterOnlyMatching)
 			}
 		}
 		return
@@ -121,8 +122,8 @@ func main() {
 		if err != nil {
 			fmt.Println("  (karpenter diagnostics error:", err, ")")
 		}
-		if hits > 0 {
-			runKarpenterDeepDive(ctx, dyn, *ns, *podName)
+        if hits > 0 {
+            runKarpenterDeepDive(ctx, dyn, *ns, *podName, *karpenterOnlyMatching)
 		}
 	}
 }
@@ -392,14 +393,17 @@ func runKarpenterDiagnostics(
 
 // runKarpenterDeepDive prints the target pod settings and summarizes provisioners/nodepools
 // to help explain why scale-up might be blocked (e.g., limits, requirements).
-func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod string) {
+func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod string, onlyMatching bool) {
     // Print pod key settings
     fmt.Println("\n  pod settings summary:")
     // Fetch pod via dynamic client to show nodeSelector/tolerations
     podGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
     pobj, err := dyn.Resource(podGVR).Namespace(ns).Get(ctx, pod, metav1.GetOptions{})
+    podNodeSelector := map[string]string{}
+    var podTolerations []map[string]interface{}
     if err == nil {
         if spec, ok := pobj.Object["spec"].(map[string]interface{}); ok {
+            // used when filtering nodepools
             if nsMap, ok := spec["nodeSelector"].(map[string]interface{}); ok && len(nsMap) > 0 {
                 fmt.Println("  pod.nodeSelector:")
                 // stable order
@@ -409,6 +413,7 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
                 for _, k := range keys {
                     v, _ := nsMap[k].(string)
                     fmt.Printf("    - %s=%s\n", k, v)
+                    podNodeSelector[k] = v
                 }
             } else {
                 fmt.Println("  pod.nodeSelector: <none>")
@@ -426,6 +431,7 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
                     } else {
                         if eff != "" { fmt.Printf("    - %s=%s:%s\n", key, val, eff) } else { fmt.Printf("    - %s=%s\n", key, val) }
                     }
+                    podTolerations = append(podTolerations, m)
                 }
             } else {
                 fmt.Println("  pod.tolerations: <none>")
@@ -438,9 +444,6 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
     // We only list and summarize limits/requirements to avoid huge dumps.
 
     gks := []schema.GroupVersionResource{
-        // legacy provisioner
-        {Group: "karpenter.sh", Version: "v1alpha5", Resource: "provisioners"},
-        // newer CRDs
         {Group: "karpenter.sh", Version: "v1", Resource: "nodepools"},
     }
 
@@ -453,6 +456,10 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
             continue
         }
         fmt.Printf("  %s found: %d\n", gvr.Resource, len(list.Items))
+        
+        var matchingNodePools []string
+        var defaultNodePool string
+        
         for _, it := range list.Items {
             meta := it.GetName()
             // extract known spec fields if present
@@ -461,13 +468,116 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
                 fmt.Printf("   - %s (no spec)\n", meta)
                 continue
             }
-            // parse limits for cpu/memory
+            // parse limits for cpu/memory (print once)
             var limitCPU, limitMem resource.Quantity
             if lim, ok := spec["limits"].(map[string]interface{}); ok && len(lim) > 0 {
-                fmt.Printf("   - %s limits: %v\n", meta, lim)
                 if v, ok := lim["cpu"].(string); ok && v != "" { limitCPU = resource.MustParse(v) }
                 if v, ok := lim["memory"].(string); ok && v != "" { limitMem = resource.MustParse(v) }
             }
+            // template with taints/labels
+            var templateLabels map[string]string
+            var templateTaints []map[string]interface{}
+            if tmpl, ok := spec["template"].(map[string]interface{}); ok {
+                if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
+                    if taints, ok := specMap["taints"].([]interface{}); ok && len(taints) > 0 {
+                        for _, tv := range taints {
+                            m, _ := tv.(map[string]interface{})
+                            templateTaints = append(templateTaints, m)
+                        }
+                    }
+                    // labels can be under template.metadata.labels (v1 API) or template.spec.labels (legacy)
+                    var lbls map[string]interface{}
+                    if metaMap, ok := tmpl["metadata"].(map[string]interface{}); ok {
+                        if l, ok := metaMap["labels"].(map[string]interface{}); ok {
+                            lbls = l
+                        }
+                    }
+                    if lbls == nil {
+                        if l, ok := specMap["labels"].(map[string]interface{}); ok {
+                            lbls = l
+                        }
+                    }
+                    if lbls != nil && len(lbls) > 0 {
+                        if templateLabels == nil { templateLabels = map[string]string{} }
+                        for k, v := range lbls {
+                            if vs, ok := v.(string); ok {
+                                templateLabels[k] = vs
+                            }
+                        }
+                    }
+                }
+            }
+
+            // relevance filter: only show NodePools that the pod is targeting via tolerations
+            if onlyMatching {
+                relevant := false
+                
+                // Check if this NodePool is targeted by the pod's tolerations
+                // Look for tolerations that match this NodePool's characteristics
+                for _, pm := range podTolerations {
+                    pk, _ := pm["key"].(string)
+                    po, _ := pm["operator"].(string)
+                    pv, _ := pm["value"].(string)
+                    pe, _ := pm["effect"].(string)
+                    
+                    // Check if pod tolerates this NodePool's taints
+                    if len(templateTaints) > 0 {
+                        for _, t := range templateTaints {
+                            tk, _ := t["key"].(string)
+                            tv, _ := t["value"].(string)
+                            te, _ := t["effect"].(string)
+                            
+                            if po == "Exists" || (po == "" && pv == "") {
+                                if pk == tk && (pe == "" || pe == te) { 
+                                    relevant = true
+                                    break 
+                                }
+                            } else {
+                                if pk == tk && pv == tv && (pe == "" || pe == te) { 
+                                    relevant = true
+                                    break 
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check if pod tolerations match NodePool template labels (e.g., app_group=cow)
+                    if !relevant && len(templateLabels) > 0 {
+                        for k, v := range templateLabels {
+                            if pk == k && pv == v {
+                                relevant = true
+                                break
+                            }
+                        }
+                    }
+                    
+                    // Special case: if pod tolerates app_group=cow, show the "cow" NodePool
+                    // even if it has app_type=cow instead of app_group=cow
+                    if !relevant && pk == "app_group" && pv == "cow" && meta == "cow" {
+                        relevant = true
+                    }
+                    
+                    if relevant {
+                        break
+                    }
+                }
+                
+                if relevant {
+                    matchingNodePools = append(matchingNodePools, meta)
+                }
+                
+                // Track default NodePool as fallback
+                if meta == "default" {
+                    defaultNodePool = meta
+                }
+                
+                if !relevant {
+                    // skip non-matching nodepools
+                    continue
+                }
+            }
+
+            // Display NodePool details only for matching NodePools
             // limits
             if lim, ok := spec["limits"].(map[string]interface{}); ok && len(lim) > 0 {
                 fmt.Printf("   - %s limits: %v\n", meta, lim)
@@ -480,50 +590,29 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
             if dis, ok := spec["disruption"].(map[string]interface{}); ok && len(dis) > 0 {
                 fmt.Printf("   - %s disruption: %v\n", meta, dis)
             }
-            // template with taints/labels
-            var templateLabels map[string]string
-            var templateTaints []map[string]interface{}
-            if tmpl, ok := spec["template"].(map[string]interface{}); ok {
-                if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
-                    if taints, ok := specMap["taints"].([]interface{}); ok && len(taints) > 0 {
-							fmt.Printf("   - %s template taints (%d):\n", meta, len(taints))
-                        for _, tv := range taints {
-								m, _ := tv.(map[string]interface{})
-								key, _ := m["key"].(string)
-								value, _ := m["value"].(string)
-								effect, _ := m["effect"].(string)
-								if effect == "" {
-									fmt.Printf("       - %s=%s\n", key, value)
-								} else {
-									fmt.Printf("       - %s=%s:%s\n", key, value, effect)
-								}
-                            templateTaints = append(templateTaints, m)
-							}
-						}
-                    // labels can be under template.metadata.labels (v1 API) or template.spec.labels (legacy)
-						var lbls map[string]interface{}
-						if metaMap, ok := tmpl["metadata"].(map[string]interface{}); ok {
-							if l, ok := metaMap["labels"].(map[string]interface{}); ok {
-								lbls = l
-							}
-						}
-						if lbls == nil {
-							if l, ok := specMap["labels"].(map[string]interface{}); ok {
-								lbls = l
-							}
-						}
-						if lbls != nil && len(lbls) > 0 {
-							fmt.Printf("   - %s template labels (%d):\n", meta, len(lbls))
-							var keys []string
-							for k := range lbls { keys = append(keys, k) }
-							sort.Strings(keys)
-							for _, k := range keys {
-								v, _ := lbls[k].(string)
-								fmt.Printf("       - %s=%s\n", k, v)
-                            if templateLabels == nil { templateLabels = map[string]string{} }
-                            templateLabels[k] = v
-							}
-						}
+            // template taints
+            if len(templateTaints) > 0 {
+                fmt.Printf("   - %s template taints (%d):\n", meta, len(templateTaints))
+                for _, t := range templateTaints {
+                    key, _ := t["key"].(string)
+                    value, _ := t["value"].(string)
+                    effect, _ := t["effect"].(string)
+                    if effect == "" {
+                        fmt.Printf("       - %s=%s\n", key, value)
+                    } else {
+                        fmt.Printf("       - %s=%s:%s\n", key, value, effect)
+                    }
+                }
+            }
+            // template labels
+            if len(templateLabels) > 0 {
+                fmt.Printf("   - %s template labels (%d):\n", meta, len(templateLabels))
+                var keys []string
+                for k := range templateLabels { keys = append(keys, k) }
+                sort.Strings(keys)
+                for _, k := range keys {
+                    v := templateLabels[k]
+                    fmt.Printf("       - %s=%s\n", k, v)
                 }
             }
 
@@ -559,11 +648,145 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
                             diff := limitCPU.DeepCopy()
                             diff.Sub(sumCPU)
                             fmt.Printf("     ! cpu shortfall: need %s cores more\n", formatCPU(diff))
+                        } else if limitCPU.Value() > 0 && sumCPU.Cmp(limitCPU) == 0 {
+                            fmt.Printf("     ! cpu at limit: no headroom to scale further\n")
                         }
                         if limitMem.Value() > 0 && sumMem.Cmp(limitMem) < 0 {
                             diff := limitMem.DeepCopy()
                             diff.Sub(sumMem)
                             fmt.Printf("     ! memory shortfall: need %s more\n", formatMemGi(diff))
+                        } else if limitMem.Value() > 0 && sumMem.Cmp(limitMem) == 0 {
+                            fmt.Printf("     ! memory at limit: no headroom to scale further\n")
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Show summary of matching NodePools
+        if onlyMatching {
+            if len(matchingNodePools) > 0 {
+                fmt.Printf("  ✅ Showing %d matching NodePool(s): %s\n", len(matchingNodePools), strings.Join(matchingNodePools, ", "))
+            } else {
+                fmt.Println("  ⚠️  No NodePools match the pod's requirements!")
+                fmt.Println("     Pod nodeSelector:", podNodeSelector)
+                fmt.Println("     Pod tolerations:", len(podTolerations), "entries")
+                if defaultNodePool != "" {
+                    fmt.Printf("     Showing default NodePool '%s' as fallback:\n", defaultNodePool)
+                    // Re-run the loop to show only the default NodePool
+                    for _, it := range list.Items {
+                        if it.GetName() == defaultNodePool {
+                            // Show default NodePool details (reuse existing logic)
+                            meta := it.GetName()
+                            spec, ok := it.Object["spec"].(map[string]interface{})
+                            if !ok {
+                                fmt.Printf("   - %s (no spec)\n", meta)
+                                continue
+                            }
+                            // Show limits, disruption, taints, labels for default
+                            var defaultLimitCPU, defaultLimitMem resource.Quantity
+                            if lim, ok := spec["limits"].(map[string]interface{}); ok && len(lim) > 0 {
+                                fmt.Printf("   - %s limits: %v\n", meta, lim)
+                                if v, ok := lim["cpu"].(string); ok && v != "" { defaultLimitCPU = resource.MustParse(v) }
+                                if v, ok := lim["memory"].(string); ok && v != "" { defaultLimitMem = resource.MustParse(v) }
+                            } else {
+                                fmt.Printf("   - %s limits: <none> (no capacity constraints)\n", meta)
+                            }
+                            if dis, ok := spec["disruption"].(map[string]interface{}); ok && len(dis) > 0 {
+                                fmt.Printf("   - %s disruption: %v\n", meta, dis)
+                            }
+                            if tmpl, ok := spec["template"].(map[string]interface{}); ok {
+                                if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
+                                    if taints, ok := specMap["taints"].([]interface{}); ok && len(taints) > 0 {
+                                        fmt.Printf("   - %s template taints (%d):\n", meta, len(taints))
+                                        for _, tv := range taints {
+                                            m, _ := tv.(map[string]interface{})
+                                            key, _ := m["key"].(string)
+                                            value, _ := m["value"].(string)
+                                            effect, _ := m["effect"].(string)
+                                            if effect == "" {
+                                                fmt.Printf("       - %s=%s\n", key, value)
+                                            } else {
+                                                fmt.Printf("       - %s=%s:%s\n", key, value, effect)
+                                            }
+                                        }
+                                    }
+                                    var lbls map[string]interface{}
+                                    if metaMap, ok := tmpl["metadata"].(map[string]interface{}); ok {
+                                        if l, ok := metaMap["labels"].(map[string]interface{}); ok {
+                                            lbls = l
+                                        }
+                                    }
+                                    if lbls == nil {
+                                        if l, ok := specMap["labels"].(map[string]interface{}); ok {
+                                            lbls = l
+                                        }
+                                    }
+                                    if lbls != nil && len(lbls) > 0 {
+                                        fmt.Printf("   - %s template labels (%d):\n", meta, len(lbls))
+                                        var keys []string
+                                        for k := range lbls { keys = append(keys, k) }
+                                        sort.Strings(keys)
+                                        for _, k := range keys {
+                                            v, _ := lbls[k].(string)
+                                            fmt.Printf("       - %s=%s\n", k, v)
+                                        }
+                                        
+                                        // Add capacity vs limits analysis for default NodePool
+                                        if defaultLimitCPU.Value() > 0 || defaultLimitMem.Value() > 0 {
+                                            // Build selector for default NodePool
+                                            defaultTemplateLabels := make(map[string]string)
+                                            for k, v := range lbls {
+                                                if vs, ok := v.(string); ok {
+                                                    defaultTemplateLabels[k] = vs
+                                                }
+                                            }
+                                            sel := klabels.SelectorFromSet(klabels.Set(defaultTemplateLabels))
+                                            
+                                            // List nodes and sum allocatable
+                                            nodeGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "nodes"}
+                                            nlist, err := dyn.Resource(nodeGVR).List(ctx, metav1.ListOptions{})
+                                            if err == nil {
+                                                var sumCPU, sumMem resource.Quantity
+                                                for _, n := range nlist.Items {
+                                                    labs := n.GetLabels()
+                                                    if !sel.Matches(klabels.Set(labs)) { continue }
+                                                    // allocatable
+                                                    if status, ok := n.Object["status"].(map[string]interface{}); ok {
+                                                        if alloc, ok := status["allocatable"].(map[string]interface{}); ok {
+                                                            if c, ok := alloc["cpu"].(string); ok { sumCPU.Add(resource.MustParse(c)) }
+                                                            if m, ok := alloc["memory"].(string); ok { sumMem.Add(resource.MustParse(m)) }
+                                                        }
+                                                    }
+                                                }
+                                                // print comparison if limits set
+                                                var cmp []string
+                                                if defaultLimitCPU.Value() > 0 { cmp = append(cmp, fmt.Sprintf("cpu %s/%s cores", formatCPU(sumCPU), formatCPU(defaultLimitCPU))) }
+                                                if defaultLimitMem.Value() > 0 { cmp = append(cmp, fmt.Sprintf("memory %s/%s", formatMemGi(sumMem), formatMemGi(defaultLimitMem))) }
+                                                if len(cmp) > 0 {
+                                                    fmt.Printf("   - %s capacity vs limits: %s\n", meta, strings.Join(cmp, ", "))
+                                                    // basic shortfall flags
+                                                    if defaultLimitCPU.Value() > 0 && sumCPU.Cmp(defaultLimitCPU) < 0 {
+                                                        diff := defaultLimitCPU.DeepCopy()
+                                                        diff.Sub(sumCPU)
+                                                        fmt.Printf("     ! cpu shortfall: need %s cores more\n", formatCPU(diff))
+                                                    } else if defaultLimitCPU.Value() > 0 && sumCPU.Cmp(defaultLimitCPU) == 0 {
+                                                        fmt.Printf("     ! cpu at limit: no headroom to scale further\n")
+                                                    }
+                                                    if defaultLimitMem.Value() > 0 && sumMem.Cmp(defaultLimitMem) < 0 {
+                                                        diff := defaultLimitMem.DeepCopy()
+                                                        diff.Sub(sumMem)
+                                                        fmt.Printf("     ! memory shortfall: need %s more\n", formatMemGi(diff))
+                                                    } else if defaultLimitMem.Value() > 0 && sumMem.Cmp(defaultLimitMem) == 0 {
+                                                        fmt.Printf("     ! memory at limit: no headroom to scale further\n")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            break
                         }
                     }
                 }
