@@ -111,9 +111,8 @@ func main() {
 		return
 	}
 
-	// (optional next steps: topology spread, resources, volumes…)
-	fmt.Println("\nNo hard blockers found in MVP gates (NodeSelector/Taints).")
-	fmt.Println("Next: implement resources, topologySpread, volume(AZ) checks.")
+	// Print pod events to show real issues
+	printPodEvents(ctx, cli, *ns, *podName)
 
 	// Optional: Karpenter diagnostics
 	if *enableKarpenter {
@@ -122,8 +121,8 @@ func main() {
 		if err != nil {
 			fmt.Println("  (karpenter diagnostics error:", err, ")")
 		}
-        if hits > 0 {
-            runKarpenterDeepDive(ctx, dyn, *ns, *podName, *karpenterOnlyMatching)
+		if hits > 0 {
+			runKarpenterDeepDive(ctx, dyn, *ns, *podName, *karpenterOnlyMatching)
 		}
 	}
 }
@@ -512,54 +511,73 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
             if onlyMatching {
                 relevant := false
                 
-                // Check if this NodePool is targeted by the pod's tolerations
-                // Look for tolerations that match this NodePool's characteristics
-                for _, pm := range podTolerations {
-                    pk, _ := pm["key"].(string)
-                    po, _ := pm["operator"].(string)
-                    pv, _ := pm["value"].(string)
-                    pe, _ := pm["effect"].(string)
-                    
-                    // Check if pod tolerates this NodePool's taints
-                    if len(templateTaints) > 0 {
-                        for _, t := range templateTaints {
-                            tk, _ := t["key"].(string)
-                            tv, _ := t["value"].(string)
-                            te, _ := t["effect"].(string)
-                            
-                            if po == "Exists" || (po == "" && pv == "") {
-                                if pk == tk && (pe == "" || pe == te) { 
-                                    relevant = true
-                                    break 
-                                }
-                            } else {
-                                if pk == tk && pv == tv && (pe == "" || pe == te) { 
-                                    relevant = true
-                                    break 
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Check if pod tolerations match NodePool template labels (e.g., app_group=cow)
-                    if !relevant && len(templateLabels) > 0 {
-                        for k, v := range templateLabels {
-                            if pk == k && pv == v {
-                                relevant = true
-                                break
-                            }
-                        }
-                    }
-                    
-                    // Special case: if pod tolerates app_group=cow, show the "cow" NodePool
-                    // even if it has app_type=cow instead of app_group=cow
-                    if !relevant && pk == "app_group" && pv == "cow" && meta == "cow" {
-                        relevant = true
-                    }
-                    
-                    if relevant {
+                // Check if this NodePool is compatible with the pod
+                // 1. Check nodeSelector compatibility
+                nodeSelectorMatch := true
+                // If pod has nodeSelector, NodePool must have matching template labels
+                for k, v := range podNodeSelector {
+                    if tv, ok := templateLabels[k]; !ok || tv != v {
+                        nodeSelectorMatch = false
                         break
                     }
+                }
+                // If pod has no nodeSelector, it can be scheduled on any NodePool (no restrictions)
+                
+                // 2. Check taints/tolerations compatibility
+                taintsMatch := true
+                if len(templateTaints) > 0 {
+                    for _, t := range templateTaints {
+                        tk, _ := t["key"].(string)
+                        tv, _ := t["value"].(string)
+                        te, _ := t["effect"].(string)
+                        tolOK := false
+                        for _, pm := range podTolerations {
+                            pk, _ := pm["key"].(string)
+                            po, _ := pm["operator"].(string)
+                            pv, _ := pm["value"].(string)
+                            pe, _ := pm["effect"].(string)
+                            if po == "Exists" || (po == "" && pv == "") {
+                                if pk == tk && (pe == "" || pe == te) { tolOK = true; break }
+                            } else {
+                                if pk == tk && pv == tv && (pe == "" || pe == te) { tolOK = true; break }
+                            }
+                        }
+                        if !tolOK { 
+                            taintsMatch = false
+                            break 
+                        }
+                    }
+                }
+                
+                // 3. Check OS compatibility
+                osMatch := true
+                if tmpl, ok := spec["template"].(map[string]interface{}); ok {
+                    if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
+                        if reqs, ok := specMap["requirements"].([]interface{}); ok {
+                            for _, req := range reqs {
+                                if reqMap, ok := req.(map[string]interface{}); ok {
+                                    key, _ := reqMap["key"].(string)
+                                    if key == "kubernetes.io/os" {
+                                        if values, ok := reqMap["values"].([]interface{}); ok && len(values) > 0 {
+                                            for _, val := range values {
+                                                if os, ok := val.(string); ok && os == "windows" {
+                                                    if len(podNodeSelector) == 0 || podNodeSelector["kubernetes.io/os"] == "" {
+                                                        osMatch = false
+                                                        break
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // NodePool is relevant if all checks pass
+                if nodeSelectorMatch && taintsMatch && osMatch {
+                    relevant = true
                 }
                 
                 if relevant {
@@ -666,11 +684,130 @@ func runKarpenterDeepDive(ctx context.Context, dyn dynamic.Interface, ns, pod st
         // Show summary of matching NodePools
         if onlyMatching {
             if len(matchingNodePools) > 0 {
-                fmt.Printf("  ✅ Showing %d matching NodePool(s): %s\n", len(matchingNodePools), strings.Join(matchingNodePools, ", "))
+                fmt.Printf("  ✔ Showing %d matching NodePool(s): %s\n", len(matchingNodePools), strings.Join(matchingNodePools, ", "))
             } else {
-                fmt.Println("  ⚠️  No NodePools match the pod's requirements!")
+                fmt.Println("  ✖  No NodePools match the pod's requirements!")
                 fmt.Println("     Pod nodeSelector:", podNodeSelector)
                 fmt.Println("     Pod tolerations:", len(podTolerations), "entries")
+                
+                // Show which NodePools could potentially match (for debugging)
+                fmt.Println("     NodePool compatibility analysis:")
+                for _, it := range list.Items {
+                    meta := it.GetName()
+                    spec, ok := it.Object["spec"].(map[string]interface{})
+                    if !ok { continue }
+                    
+                    var templateLabels map[string]string
+                    var templateTaints []map[string]interface{}
+                    if tmpl, ok := spec["template"].(map[string]interface{}); ok {
+                        if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
+                            if taints, ok := specMap["taints"].([]interface{}); ok && len(taints) > 0 {
+                                for _, tv := range taints {
+                                    m, _ := tv.(map[string]interface{})
+                                    templateTaints = append(templateTaints, m)
+                                }
+                            }
+                            var lbls map[string]interface{}
+                            if metaMap, ok := tmpl["metadata"].(map[string]interface{}); ok {
+                                if l, ok := metaMap["labels"].(map[string]interface{}); ok {
+                                    lbls = l
+                                }
+                            }
+                            if lbls == nil {
+                                if l, ok := specMap["labels"].(map[string]interface{}); ok {
+                                    lbls = l
+                                }
+                            }
+                            if lbls != nil && len(lbls) > 0 {
+                                if templateLabels == nil { templateLabels = map[string]string{} }
+                                for k, v := range lbls {
+                                    if vs, ok := v.(string); ok {
+                                        templateLabels[k] = vs
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check compatibility
+                    nodeSelectorMatch := true
+                    // If pod has nodeSelector, NodePool must have matching template labels
+                    for k, v := range podNodeSelector {
+                        if tv, ok := templateLabels[k]; !ok || tv != v {
+                            nodeSelectorMatch = false
+                            break
+                        }
+                    }
+                    // If pod has no nodeSelector, it can be scheduled on any NodePool (no restrictions)
+                    
+                    taintsMatch := true
+                    if len(templateTaints) > 0 {
+                        for _, t := range templateTaints {
+                            tk, _ := t["key"].(string)
+                            tv, _ := t["value"].(string)
+                            te, _ := t["effect"].(string)
+                            tolOK := false
+                            for _, pm := range podTolerations {
+                                pk, _ := pm["key"].(string)
+                                po, _ := pm["operator"].(string)
+                                pv, _ := pm["value"].(string)
+                                pe, _ := pm["effect"].(string)
+                                if po == "Exists" || (po == "" && pv == "") {
+                                    if pk == tk && (pe == "" || pe == te) { tolOK = true; break }
+                                } else {
+                                    if pk == tk && pv == tv && (pe == "" || pe == te) { tolOK = true; break }
+                                }
+                            }
+                            if !tolOK { 
+                                taintsMatch = false
+                                break 
+                            }
+                        }
+                    }
+                    
+                    // Check OS compatibility (NodePool requirements vs pod implicit requirements)
+                    osMatch := true
+                    if tmpl, ok := spec["template"].(map[string]interface{}); ok {
+                        if specMap, ok := tmpl["spec"].(map[string]interface{}); ok {
+                            if reqs, ok := specMap["requirements"].([]interface{}); ok {
+                                for _, req := range reqs {
+                                    if reqMap, ok := req.(map[string]interface{}); ok {
+                                        key, _ := reqMap["key"].(string)
+                                        if key == "kubernetes.io/os" {
+                                            if values, ok := reqMap["values"].([]interface{}); ok && len(values) > 0 {
+                                                // Check if NodePool requires Windows but pod is likely Linux
+                                                for _, val := range values {
+                                                    if os, ok := val.(string); ok && os == "windows" {
+                                                        // If pod has no explicit OS requirements, assume it's Linux
+                                                        // and Windows NodePools are incompatible
+                                                        if len(podNodeSelector) == 0 || podNodeSelector["kubernetes.io/os"] == "" {
+                                                            osMatch = false
+                                                            break
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    status := "✖ incompatible"
+                    if nodeSelectorMatch && taintsMatch && osMatch {
+                        status = "✔ compatible"
+                    } else if !nodeSelectorMatch {
+                        status = "✖ nodeSelector mismatch"
+                    } else if !taintsMatch {
+                        status = "✖ taints not tolerated"
+                    } else if !osMatch {
+                        status = "✖ OS mismatch (Windows NodePool for Linux pod)"
+                    }
+                    
+                    fmt.Printf("       - %s: %s\n", meta, status)
+                }
+                
                 if defaultNodePool != "" {
                     fmt.Printf("     Showing default NodePool '%s' as fallback:\n", defaultNodePool)
                     // Re-run the loop to show only the default NodePool
@@ -822,6 +959,39 @@ func printSelectorHint(pod *corev1.Pod) {
 		fmt.Println("Check if any nodes have matching labels.")
 	} else {
 		fmt.Println("Pod has no nodeSelector constraints.")
+	}
+}
+
+func printPodEvents(ctx context.Context, cli *kubernetes.Clientset, ns, podName string) {
+	fmt.Println("\n[3] Pod Events:")
+	events, err := cli.CoreV1().Events(ns).List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.name=%s", podName),
+	})
+	if err != nil {
+		fmt.Printf("  (error fetching events: %v)\n", err)
+		return
+	}
+	
+	if len(events.Items) == 0 {
+		fmt.Println("  No events found.")
+		return
+	}
+	
+	// Sort by last timestamp (newest first)
+	sort.Slice(events.Items, func(i, j int) bool {
+		return events.Items[i].LastTimestamp.After(events.Items[j].LastTimestamp.Time)
+	})
+	
+	// Show last 10 events
+	maxEvents := 10
+	if len(events.Items) < maxEvents {
+		maxEvents = len(events.Items)
+	}
+	
+	for i := 0; i < maxEvents; i++ {
+		event := events.Items[i]
+		fmt.Printf("  %s %s: %s (age %s)\n", 
+			event.Type, event.Reason, trim(event.Message, 120), age(event.LastTimestamp.Time))
 	}
 }
 
